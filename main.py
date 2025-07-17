@@ -1,76 +1,115 @@
-import ccxt
+import time
+import os
 import pandas as pd
 import numpy as np
-import time
 from datetime import datetime, timedelta
+from binance.client import Client
+from binance.enums import *
 
-# 🔐 Điền API Testnet
-API_KEY = 'YOUR_TESTNET_API_KEY'
-API_SECRET = 'YOUR_TESTNET_API_SECRET'
+# ==== ENV ====
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 
-symbol = 'BTC/USDT'
-timeframe = '15m'
-short_window = 5
-long_window = 20
-amount = 0.001  # Lượng BTC muốn giao dịch mỗi lần
+# ==== Client testnet ====
+client = Client(API_KEY, API_SECRET)
+client.API_URL = 'https://testnet.binance.vision/api'
 
-# ✅ Khởi tạo Binance testnet client
-binance = ccxt.binance({
-    'apiKey': API_KEY,
-    'secret': API_SECRET,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
-binance.set_sandbox_mode(True)
+symbol = "BTCUSDT"
+interval = Client.KLINE_INTERVAL_1HOUR
+capital = 1000  # Giả định số vốn ban đầu để tính khối lượng trade (không dùng nếu lấy từ số dư thực)
 
-# ✅ Hàm lấy dữ liệu nến từ Binance
-def fetch_binance_ohlcv(symbol, timeframe='15m', since_days=5):
-    since = binance.parse8601((datetime.utcnow() - timedelta(days=since_days)).isoformat())
-    ohlcv = binance.fetch_ohlcv(symbol, timeframe=timeframe, since=since)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+# ==== Lấy dữ liệu nến ====
+def fetch_ohlcv(symbol, interval, lookback_days=365):
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(days=lookback_days)
+    print(f"📊 Lấy dữ liệu từ {start_time.date()} đến {end_time.date()}...")
+
+    klines = client.get_historical_klines(symbol, interval, start_time.strftime("%d %b %Y %H:%M:%S"))
+    df = pd.DataFrame(klines, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume',
+                                       'Close_time', 'Quote_asset_volume', 'Number_of_trades',
+                                       'Taker_buy_base_vol', 'Taker_buy_quote_vol', 'Ignore'])
+
+    df['Close'] = df['Close'].astype(float)
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df[['timestamp', 'Close']]
+
+# ==== Chiến lược MA ====
+def apply_strategy(df, short_window=10, long_window=20):
+    df['short_ma'] = df['Close'].rolling(window=short_window).mean()
+    df['long_ma'] = df['Close'].rolling(window=long_window).mean()
+    df['signal'] = 0
+    df.loc[short_window:, 'signal'] = np.where(df['short_ma'][short_window:] > df['long_ma'][short_window:], 1, 0)
+    df['position'] = df['signal'].diff()
     return df
 
-# ✅ Hàm tính tín hiệu MA
-def generate_signals(df, short_window=5, long_window=20):
-    df = df.copy()
-    df['short_ma'] = df['close'].rolling(window=short_window).mean()
-    df['long_ma'] = df['close'].rolling(window=long_window).mean()
-    df['position'] = np.where(df['short_ma'] > df['long_ma'], 1, 0)
-    df['signal'] = df['position'].diff()
-    return df
-
-# ✅ Đặt lệnh market MUA/BÁN
-def place_order(signal):
+# ==== Lệnh giao dịch ====
+def place_order(side, quantity):
     try:
-        if signal == 1:
-            order = binance.create_market_buy_order(symbol, amount)
-            print(f"🟢 Đã đặt lệnh MUA: {order}")
-        elif signal == -1:
-            order = binance.create_market_sell_order(symbol, amount)
-            print(f"🔴 Đã đặt lệnh BÁN: {order}")
+        order = client.create_order(
+            symbol=symbol,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+        print(f"🟢 Đặt lệnh {side} thành công: {order}")
+        return order
     except Exception as e:
-        print(f"❌ Lỗi khi đặt lệnh: {e}")
+        print(f"❌ Lỗi đặt lệnh {side}: {e}")
+        return None
 
-# ✅ Vòng lặp bot trading
-def trading_loop():
-    print(f"🚀 Bắt đầu bot MA trên Testnet Binance - Symbol: {symbol}")
-    while True:
-        df = fetch_binance_ohlcv(symbol, timeframe, since_days=5)
-        df = generate_signals(df, short_window, long_window)
+# ==== Kiểm tra số dư USDT và BTC ====
+def get_balance(asset):
+    try:
+        balance = client.get_asset_balance(asset=asset)
+        free_amount = float(balance['free']) if balance else 0
+        print(f"💰 Số dư {asset}: {free_amount}")
+        return free_amount
+    except Exception as e:
+        print(f"⚠️ Không thể lấy số dư {asset}: {e}")
+        return 0
 
-        last_signal = df['signal'].iloc[-1]
-        print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Tín hiệu: {last_signal}")
+# ==== Tính khối lượng trade ====
+def calculate_quantity(price, usdt_balance):
+    quantity = round(usdt_balance / price, 6)
+    return quantity
 
-        if last_signal == 1:
-            place_order(1)
-        elif last_signal == -1:
-            place_order(-1)
+# ==== BOT ====
+def run_bot():
+    df = fetch_ohlcv(symbol, interval)
+    df = apply_strategy(df)
+
+    last_signal = df['position'].iloc[-1]
+    last_price = df['Close'].iloc[-1]
+
+    print(f"📈 Giá hiện tại: {last_price:.2f}")
+
+    usdt_balance = get_balance("USDT")
+    btc_balance = get_balance("BTC")
+    quantity = calculate_quantity(last_price, usdt_balance)
+
+    if last_signal == 1:
+        print("✅ Tín hiệu MUA")
+        if usdt_balance >= 10:  # Binance yêu cầu số lệnh > 10 USDT
+            place_order(SIDE_BUY, quantity)
         else:
-            print("🔄 Không có tín hiệu mới")
+            print("⚠️ Không đủ USDT để mua.")
+    elif last_signal == -1:
+        print("✅ Tín hiệu BÁN")
+        if btc_balance >= 0.0001:
+            place_order(SIDE_SELL, round(btc_balance, 6))
+        else:
+            print("⚠️ Không đủ BTC để bán.")
+    else:
+        print("⏸️ Không có tín hiệu giao dịch.")
 
-        # Chờ 15 phút
-        time.sleep(15 * 60)
-
-# 👉 Gọi hàm để chạy bot
-# trading_loop()  # Bỏ comment dòng này để chạy bot
+# ==== Loop chính ====
+if __name__ == "__main__":
+    print("🚀 Khởi động bot giao dịch Binance Testnet...")
+    while True:
+        try:
+            run_bot()
+            print("🕐 Đợi 60s...\n")
+            time.sleep(60)
+        except Exception as e:
+            print(f"🔥 Lỗi: {e}")
+            time.sleep(60)

@@ -5,8 +5,8 @@ import time
 from datetime import datetime, timedelta
 
 # 🔐 Điền API Testnet
-API_KEY = 'k8RvLBhl5YFPZcHPnTHqWencaLkwrLrSMltc03bZMAc6uRmkuO14Rp4LBwmszsB5'
-API_SECRET = 'cmj6lD4PvcyMSc8GSVvmpTejog7ZoDovCmzUjPz5dPQdhhCksyjz3pFTUXgUUFHG'
+API_KEY = 'YOUR_TESTNET_API_KEY'
+API_SECRET = 'YOUR_TESTNET_API_SECRET'
 
 symbol = 'BTC/USDT'
 timeframe = '15m'

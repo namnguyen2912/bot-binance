@@ -1,5 +1,5 @@
-python-binance==1.0.17
+lightgbm
 pandas
 numpy
-requests
-python-dotenv
+yfinance
+python-binance

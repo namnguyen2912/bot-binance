@@ -61,13 +61,19 @@ def create_features(data):
 
 # ==== Train AI model ====
 def train_model(df_feat):
-    X = df_feat[['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']].values
-    y = df_feat['target'].values
+    feature_cols = ['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']
+    X = df_feat[feature_cols]
+    y = df_feat['target']
+
+    if len(X) < 100 or y.nunique() < 2:
+        print("⚠️ Dữ liệu huấn luyện không đủ hoặc thiếu nhãn phân loại. Bỏ qua huấn luyện.")
+        return None
+
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
     best_params = {'n_estimators': 133, 'max_depth': 7, 'learning_rate': 0.05082515314354772}
     model = LGBMClassifier(**best_params)
     model.fit(X_train, y_train)
-    print("=== BÁO CÁO PHÂN LOẠI AI V9++ ===")
+    print("=== BÁO CÁO PHÂN LOẠI AI ===")
     print(classification_report(y_test, model.predict(X_test)))
     return model
 
@@ -104,9 +110,11 @@ def run_bot():
     df = fetch_ohlcv(symbol, interval)
     df_feat = create_features(df)
     model = train_model(df_feat)
+    if model is None:
+        return
 
-    latest = df_feat.iloc[-1:]
-    X_live = latest[['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']].values
+    latest = df_feat.iloc[[-1]]  # Giữ lại DataFrame để tránh warning
+    X_live = latest[['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']]
     pred = model.predict(X_live)[0]
 
     price = latest['close'].values[0]
@@ -133,7 +141,7 @@ if __name__ == "__main__":
     while True:
         try:
             run_bot()
-            print("🕐 Đợi 60s...")
+            print("🕐 Đợi 60s...\n")
             time.sleep(60)
         except Exception as e:
             print(f"🔥 Lỗi: {e}")

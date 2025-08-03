@@ -70,7 +70,7 @@ def train_model(df_feat):
         return None
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    best_params = {'n_estimators': 133, 'max_depth': 7, 'learning_rate': 0.05082515314354772}
+    best_params = {'n_estimators': 133, 'max_depth': 7, 'learning_rate': 0.05}
     model = LGBMClassifier(**best_params)
     model.fit(X_train, y_train)
     print("=== BÁO CÁO PHÂN LOẠI AI ===")
@@ -102,8 +102,9 @@ def place_order(side, quantity):
         print(f"❌ Lỗi đặt lệnh {side}: {e}")
         return None
 
-def calculate_quantity(price, usdt_balance):
-    return round(usdt_balance / price, 6)
+def calculate_quantity(price, usdt_balance, fixed_amount=1000):
+    amount = min(usdt_balance, fixed_amount)
+    return round(amount / price, 6)
 
 # ==== Bot logic ====
 def run_bot():
@@ -113,7 +114,7 @@ def run_bot():
     if model is None:
         return
 
-    latest = df_feat.iloc[[-1]]  # Giữ lại DataFrame để tránh warning
+    latest = df_feat.iloc[[-1]]  # DataFrame
     X_live = latest[['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']]
     pred = model.predict(X_live)[0]
 
@@ -127,10 +128,12 @@ def run_bot():
         print("✅ AI tín hiệu MUA")
         if usdt >= 10:
             qty = calculate_quantity(price, usdt)
+            print(f"👉 Đặt mua ~{qty} BTC (tương đương ~1000 USDT)")
             place_order(SIDE_BUY, qty)
     elif pred == -1:
         print("✅ AI tín hiệu BÁN")
         if btc >= 0.0001:
+            print(f"👉 Đặt bán toàn bộ {btc} BTC")
             place_order(SIDE_SELL, round(btc, 6))
     else:
         print("⏸️ Không có tín hiệu rõ ràng từ AI")

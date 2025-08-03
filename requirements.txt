@@ -1,5 +1,5 @@
-binance-connector==1.0.3
-lightgbm==3.3.2
-scikit-learn==1.2.2
-pandas==1.5.3
-numpy==1.24.3
+binance-connector==3.12.0
+lightgbm
+scikit-learn
+pandas
+numpy

@@ -19,6 +19,7 @@ client.API_URL = 'https://testnet.binance.vision/api'
 
 symbol = "BTCUSDT"
 interval = Client.KLINE_INTERVAL_1HOUR
+lot_precision = 6  # sẽ lấy lại từ info dưới
 
 # ==== Fetch historical OHLCV ====
 def fetch_ohlcv(symbol, interval, lookback_days=365):
@@ -88,6 +89,18 @@ def get_balance(asset):
         print(f"⚠️ Không thể lấy số dư {asset}: {e}")
         return 0
 
+def get_lot_step(symbol):
+    info = client.get_symbol_info(symbol)
+    for f in info['filters']:
+        if f['filterType'] == 'LOT_SIZE':
+            step_size = float(f['stepSize'])
+            return step_size
+    return 0.000001
+
+def round_step_size(quantity, step_size):
+    precision = int(round(-np.log10(step_size)))
+    return round(quantity - (quantity % step_size), precision)
+
 def place_order(side, quantity):
     try:
         order = client.create_order(
@@ -104,7 +117,9 @@ def place_order(side, quantity):
 
 def calculate_quantity(price, usdt_balance, fixed_amount=1000):
     amount = min(usdt_balance, fixed_amount)
-    return round(amount / price, 6)
+    raw_qty = amount / price
+    step_size = get_lot_step(symbol)
+    return round_step_size(raw_qty, step_size)
 
 # ==== Bot logic ====
 def run_bot():
@@ -114,7 +129,7 @@ def run_bot():
     if model is None:
         return
 
-    latest = df_feat.iloc[[-1]]  # DataFrame
+    latest = df_feat.iloc[[-1]]
     X_live = latest[['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']]
     pred = model.predict(X_live)[0]
 
@@ -134,7 +149,7 @@ def run_bot():
         print("✅ AI tín hiệu BÁN")
         if btc >= 0.0001:
             print(f"👉 Đặt bán toàn bộ {btc} BTC")
-            place_order(SIDE_SELL, round(btc, 6))
+            place_order(SIDE_SELL, round_step_size(btc, get_lot_step(symbol)))
     else:
         print("⏸️ Không có tín hiệu rõ ràng từ AI")
 

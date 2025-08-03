@@ -1,3 +1,6 @@
+# === AI Binance Futures Bot (testnet) ===
+# Kết hợp thuật toán AI + giao dịch Futures với quản lý vốn 5%, chốt lời 3%, cắt lỗ 1.5%
+
 import time
 import os
 import pandas as pd
@@ -6,55 +9,38 @@ from datetime import datetime, timedelta
 from lightgbm import LGBMClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
-from binance.client import Client
-from binance.enums import *
+from binance.um_futures import UMFutures
+from binance.error import ClientError
 
 # ==== ENV ====
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
-
-# ==== Client testnet ====
-client = Client(API_KEY, API_SECRET)
-client.API_URL = 'https://testnet.binance.vision/api'
+client = UMFutures(key=API_KEY, secret=API_SECRET, base_url="https://testnet.binancefuture.com")
 
 symbol = "BTCUSDT"
-interval = Client.KLINE_INTERVAL_1HOUR
+interval = '1h'
 
-# ==== Vốn thực tế & cài đặt giao dịch ====
-def get_total_capital():
-    try:
-        balance = client.get_asset_balance(asset="USDT")
-        total = float(balance['free']) if balance else 0.0
-        print(f"\U0001F4BC Vốn thực tế hiện tại: {total} USDT")
-        return total
-    except Exception as e:
-        print(f"⚠️ Không thể lấy vốn thực tế: {e}")
-        return 0.0
+CAPITAL = 1000.0               # Tổng vốn (giả định hoặc quản lý nội bộ)
+ORDER_PERCENT = 0.05           # Mỗi lệnh tối đa 5%
+TP_PCT = 0.03                  # Take profit
+SL_PCT = 0.015                 # Stop loss
 
-order_percent = 0.05            # Mỗi lệnh tối đa 5%
-take_profit_pct = 0.03          # 3% chốt lời
-stop_loss_pct = 0.015           # 1.5% cắt lỗ
+open_positions = []            # Theo dõi vị thế mở: [{'qty':..., 'entry':...}]
 
-# Danh sách vị thế đang mở lưu theo dict: mỗi vị thế {'qty': float, 'buy_price': float}
-open_positions = []
-
-# ==== Fetch historical OHLCV ====
+# ==== Dữ liệu giá ====
 def fetch_ohlcv(symbol, interval, lookback_days=365):
     end_time = datetime.utcnow()
     start_time = end_time - timedelta(days=lookback_days)
-    print(f"\U0001F4CA Lấy dữ liệu từ {start_time.date()} đến {end_time.date()}...")
-
-    klines = client.get_historical_klines(symbol, interval, start_time.strftime("%d %b %Y %H:%M:%S"))
-    df = pd.DataFrame(klines, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume',
-                                       'Close_time', 'Quote_asset_volume', 'Number_of_trades',
-                                       'Taker_buy_base_vol', 'Taker_buy_quote_vol', 'Ignore'])
-    df = df[['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']]
-    df.columns = ['open_time', 'open', 'high', 'low', 'close', 'volume']
-    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+    klines = client.klines(symbol=symbol, interval=interval, startTime=int(start_time.timestamp()*1000))
+    df = pd.DataFrame(klines, columns=["timestamp", "open", "high", "low", "close", "volume", "close_time",
+                                       "qav", "num_trades", "tbbav", "tbqav", "ignore"])
+    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+    df.columns = ['time', 'open', 'high', 'low', 'close', 'volume']
+    df['time'] = pd.to_datetime(df['time'], unit='ms')
     df = df.astype(float, errors='ignore')
     return df.dropna()
 
-# ==== Indicators & Features ====
+# ==== Chỉ báo & đặc trưng ====
 def rsi(series, period=14):
     delta = series.diff()
     gain = np.where(delta > 0, delta, 0)
@@ -64,97 +50,72 @@ def rsi(series, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def create_features(data):
-    df_feat = data.copy()
+def create_features(df):
+    df_feat = df.copy()
     df_feat['return'] = df_feat['close'].pct_change()
     df_feat['ema5'] = df_feat['close'].ewm(span=5).mean()
     df_feat['ema10'] = df_feat['close'].ewm(span=10).mean()
     df_feat['ema20'] = df_feat['close'].ewm(span=20).mean()
     df_feat['ema_cross'] = np.where(df_feat['ema5'] > df_feat['ema10'], 1, -1)
-    df_feat['rsi'] = rsi(df_feat['close'], 14)
+    df_feat['rsi'] = rsi(df_feat['close'])
     df_feat['future_return'] = df_feat['close'].shift(-5) / df_feat['close'] - 1
     df_feat['target'] = np.where(df_feat['future_return'] > 0.002, 1,
                                  np.where(df_feat['future_return'] < -0.002, -1, 0))
     return df_feat.dropna()
 
-# ==== Train AI model ====
+# ==== Huấn luyện AI ====
 def train_model(df_feat):
-    feature_cols = ['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']
-    X = df_feat[feature_cols]
+    X = df_feat[['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']]
     y = df_feat['target']
 
     if len(X) < 100 or y.nunique() < 2:
-        print("⚠️ Dữ liệu huấn luyện không đủ hoặc thiếu nhãn phân loại. Bỏ qua huấn luyện.")
+        print("⚠️ Dữ liệu không đủ.")
         return None
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    best_params = {'n_estimators': 133, 'max_depth': 7, 'learning_rate': 0.05}
-    model = LGBMClassifier(**best_params)
+    model = LGBMClassifier(n_estimators=133, max_depth=7, learning_rate=0.05)
     model.fit(X_train, y_train)
-    print("=== BÁO CÁO PHÂN LOẠI AI ===")
+    print("=== AI MODEL ===")
     print(classification_report(y_test, model.predict(X_test)))
     return model
 
-# ==== Giao dịch thực ====
-def get_lot_step(symbol):
-    info = client.get_symbol_info(symbol)
-    for f in info['filters']:
-        if f['filterType'] == 'LOT_SIZE':
-            return float(f['stepSize'])
-    return 0.000001
-
-def round_step_size(quantity, step_size):
-    precision = int(round(-np.log10(step_size)))
-    return round(quantity - (quantity % step_size), precision)
-
-def place_order(side, quantity):
+# ==== Đặt lệnh ====
+def place_order(side, qty):
     try:
-        order = client.create_order(
-            symbol=symbol,
-            side=side,
-            type=ORDER_TYPE_MARKET,
-            quantity=quantity
-        )
-        print(f"🟢 Đặt lệnh {side} thành công: {order}")
-        return order
-    except Exception as e:
-        print(f"❌ Lỗi đặt lệnh {side}: {e}")
+        return client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
+    except ClientError as e:
+        print(f"❌ Lỗi đặt lệnh {side}: {e.error_message}")
         return None
 
-def calculate_quantity(price, usdt_amount):
-    qty_raw = usdt_amount / price
-    step_size = get_lot_step(symbol)
-    qty = round_step_size(qty_raw, step_size)
-    return qty
+def get_price():
+    ticker = client.ticker_price(symbol=symbol)
+    return float(ticker['price'])
 
-# ==== Kiểm tra vị thế để chốt lời/cắt lỗ ====
-def check_close_positions(current_price):
+def round_qty(value):
+    return round(value, 3)
+
+# ==== Kiểm tra vị thế để đóng ====
+def check_close_positions(price):
     global open_positions
-    positions_to_close = []
+    to_close = []
     for i, pos in enumerate(open_positions):
-        buy_price = pos['buy_price']
+        entry = pos['entry']
         qty = pos['qty']
-        profit_ratio = (current_price - buy_price) / buy_price
-        if profit_ratio >= take_profit_pct:
-            print(f"⚡ Chốt lời vị thế mua {qty} BTC mua tại {buy_price}, giá hiện tại {current_price}")
-            qty_rounded = round_step_size(qty, get_lot_step(symbol))
-            place_order(SIDE_SELL, qty_rounded)
-            positions_to_close.append(i)
-        elif profit_ratio <= -stop_loss_pct:
-            print(f"⚡ Cắt lỗ vị thế mua {qty} BTC mua tại {buy_price}, giá hiện tại {current_price}")
-            qty_rounded = round_step_size(qty, get_lot_step(symbol))
-            place_order(SIDE_SELL, qty_rounded)
-            positions_to_close.append(i)
-    for index in reversed(positions_to_close):
-        open_positions.pop(index)
+        pnl = (price - entry) / entry
+        if pnl >= TP_PCT:
+            print(f"🚀 Chốt lời {qty} BTC, vào {entry} ra {price} ({pnl*100:.2f}%)")
+            place_order('SELL', qty)
+            to_close.append(i)
+        elif pnl <= -SL_PCT:
+            print(f"🔻 Cắt lỗ {qty} BTC, vào {entry} ra {price} ({pnl*100:.2f}%)")
+            place_order('SELL', qty)
+            to_close.append(i)
+    for i in reversed(to_close):
+        open_positions.pop(i)
 
-# ==== Bot logic ====
+# ==== Bot chính ====
 def run_bot():
     global open_positions
-
-    total_capital = get_total_capital()
-    max_order_value = total_capital * order_percent
-
     df = fetch_ohlcv(symbol, interval)
     df_feat = create_features(df)
     model = train_model(df_feat)
@@ -164,46 +125,36 @@ def run_bot():
     latest = df_feat.iloc[[-1]]
     X_live = latest[['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']]
     pred = model.predict(X_live)[0]
-
     price = latest['close'].values[0]
-    print(f"📈 Giá hiện tại: {price:.2f} | Tín hiệu AI: {pred}")
 
+    print(f"\n📉 Giá hiện tại: {price:.2f} | Tín hiệu AI: {pred}")
     check_close_positions(price)
 
     if pred == 1:
-        print("✅ AI tín hiệu MUA")
-        if total_capital >= max_order_value:
-            qty = calculate_quantity(price, max_order_value)
-            if qty > 0:
-                print(f"👉 Đặt mua ~{qty} BTC (tương đương ~{max_order_value} USDT)")
-                order = place_order(SIDE_BUY, qty)
-                if order is not None:
-                    open_positions.append({'qty': qty, 'buy_price': price})
-            else:
-                print("⚠️ Số lượng mua tính ra bằng 0, bỏ qua lệnh mua.")
-        else:
-            print("⚠️ Vốn không đủ để mua lệnh mới.")
+        print("✅ AI báo MUA")
+        usdt_amount = CAPITAL * ORDER_PERCENT
+        qty = round_qty(usdt_amount / price)
+        if qty > 0:
+            res = place_order('BUY', qty)
+            if res:
+                open_positions.append({'qty': qty, 'entry': price})
     elif pred == -1:
-        print("✅ AI tín hiệu BÁN")
-        if len(open_positions) > 0:
-            total_qty = sum(pos['qty'] for pos in open_positions)
-            qty_rounded = round_step_size(total_qty, get_lot_step(symbol))
-            print(f"👉 Đặt bán toàn bộ vị thế: {qty_rounded} BTC")
-            order = place_order(SIDE_SELL, qty_rounded)
-            if order is not None:
+        print("✅ AI báo BÁN")
+        total_qty = round_qty(sum(p['qty'] for p in open_positions))
+        if total_qty > 0:
+            res = place_order('SELL', total_qty)
+            if res:
                 open_positions.clear()
-        else:
-            print("⚠️ Không có vị thế mở để bán.")
     else:
-        print("⏸️ Không có tín hiệu rõ ràng từ AI")
+        print("⏸️ AI không chắc chắn.")
 
-# ==== Loop chính ====
-if __name__ == "__main__":
-    print("🚀 AI Binance Bot khởi động...")
+# ==== Loop ====
+if __name__ == '__main__':
+    print("🚀 Khởi động bot Futures...")
     while True:
         try:
             run_bot()
-            print("🕐 Đợi 60s...\n")
+            print("⏱️ Đợi 60s...")
             time.sleep(60)
         except Exception as e:
             print(f"🔥 Lỗi: {e}")

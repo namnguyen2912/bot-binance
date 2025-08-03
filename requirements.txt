@@ -1,6 +1,5 @@
+binance-connector
 lightgbm
+scikit-learn
 pandas
 numpy
-yfinance
-python-binance
-scikit-learn

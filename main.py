@@ -19,7 +19,16 @@ client.API_URL = 'https://testnet.binance.vision/api'
 
 symbol = "BTCUSDT"
 interval = Client.KLINE_INTERVAL_1HOUR
-lot_precision = 6  # sẽ lấy lại từ info dưới
+
+# ==== Vốn nội bộ & cài đặt giao dịch ====
+total_capital = 1000.0          # Vốn quản lý nội bộ USDT
+order_percent = 0.05            # Mỗi lệnh tối đa 5% vốn = 50 USDT
+max_order_value = total_capital * order_percent  # 50 USDT
+take_profit_pct = 0.03          # 3% chốt lời
+stop_loss_pct = 0.015           # 1.5% cắt lỗ
+
+# Danh sách vị thế đang mở lưu theo dict: mỗi vị thế {'qty': float, 'buy_price': float}
+open_positions = []
 
 # ==== Fetch historical OHLCV ====
 def fetch_ohlcv(symbol, interval, lookback_days=365):
@@ -93,8 +102,7 @@ def get_lot_step(symbol):
     info = client.get_symbol_info(symbol)
     for f in info['filters']:
         if f['filterType'] == 'LOT_SIZE':
-            step_size = float(f['stepSize'])
-            return step_size
+            return float(f['stepSize'])
     return 0.000001
 
 def round_step_size(quantity, step_size):
@@ -115,14 +123,40 @@ def place_order(side, quantity):
         print(f"❌ Lỗi đặt lệnh {side}: {e}")
         return None
 
-def calculate_quantity(price, usdt_balance, fixed_amount=1000):
-    amount = min(usdt_balance, fixed_amount)
-    raw_qty = amount / price
+def calculate_quantity(price, usdt_amount):
+    qty_raw = usdt_amount / price
     step_size = get_lot_step(symbol)
-    return round_step_size(raw_qty, step_size)
+    qty = round_step_size(qty_raw, step_size)
+    return qty
+
+# ==== Kiểm tra vị thế để chốt lời/cắt lỗ ====
+def check_close_positions(current_price):
+    global open_positions, total_capital
+    positions_to_close = []
+    for i, pos in enumerate(open_positions):
+        buy_price = pos['buy_price']
+        qty = pos['qty']
+        profit_ratio = (current_price - buy_price) / buy_price
+        if profit_ratio >= take_profit_pct:
+            print(f"⚡ Chốt lời vị thế mua {qty} BTC mua tại {buy_price}, giá hiện tại {current_price}")
+            qty_rounded = round_step_size(qty, get_lot_step(symbol))
+            place_order(SIDE_SELL, qty_rounded)
+            total_capital += qty * current_price  # Cộng vốn sau bán
+            positions_to_close.append(i)
+        elif profit_ratio <= -stop_loss_pct:
+            print(f"⚡ Cắt lỗ vị thế mua {qty} BTC mua tại {buy_price}, giá hiện tại {current_price}")
+            qty_rounded = round_step_size(qty, get_lot_step(symbol))
+            place_order(SIDE_SELL, qty_rounded)
+            total_capital += qty * current_price  # Cộng vốn sau bán
+            positions_to_close.append(i)
+    # Xóa vị thế đã đóng
+    for index in reversed(positions_to_close):
+        open_positions.pop(index)
 
 # ==== Bot logic ====
 def run_bot():
+    global total_capital, open_positions
+
     df = fetch_ohlcv(symbol, interval)
     df_feat = create_features(df)
     model = train_model(df_feat)
@@ -136,20 +170,37 @@ def run_bot():
     price = latest['close'].values[0]
     print(f"📈 Giá hiện tại: {price:.2f} | Tín hiệu AI: {pred}")
 
-    usdt = get_balance("USDT")
-    btc = get_balance("BTC")
+    # Trước tiên kiểm tra vị thế để chốt lời/cắt lỗ
+    check_close_positions(price)
 
+    # Sau đó xử lý tín hiệu mua bán mới
     if pred == 1:
         print("✅ AI tín hiệu MUA")
-        if usdt >= 10:
-            qty = calculate_quantity(price, usdt)
-            print(f"👉 Đặt mua ~{qty} BTC (tương đương ~1000 USDT)")
-            place_order(SIDE_BUY, qty)
+        if total_capital >= max_order_value:
+            qty = calculate_quantity(price, max_order_value)
+            if qty > 0:
+                print(f"👉 Đặt mua ~{qty} BTC (tương đương ~{max_order_value} USDT)")
+                order = place_order(SIDE_BUY, qty)
+                if order is not None:
+                    open_positions.append({'qty': qty, 'buy_price': price})
+                    total_capital -= max_order_value
+            else:
+                print("⚠️ Số lượng mua tính ra bằng 0, bỏ qua lệnh mua.")
+        else:
+            print("⚠️ Vốn không đủ để mua lệnh mới.")
     elif pred == -1:
         print("✅ AI tín hiệu BÁN")
-        if btc >= 0.0001:
-            print(f"👉 Đặt bán toàn bộ {btc} BTC")
-            place_order(SIDE_SELL, round_step_size(btc, get_lot_step(symbol)))
+        # Khi tín hiệu bán, bán toàn bộ vị thế đang mở để tránh dư vị thế
+        if len(open_positions) > 0:
+            total_qty = sum(pos['qty'] for pos in open_positions)
+            qty_rounded = round_step_size(total_qty, get_lot_step(symbol))
+            print(f"👉 Đặt bán toàn bộ vị thế: {qty_rounded} BTC")
+            order = place_order(SIDE_SELL, qty_rounded)
+            if order is not None:
+                open_positions.clear()
+                total_capital += qty_rounded * price
+        else:
+            print("⚠️ Không có vị thế mở để bán.")
     else:
         print("⏸️ Không có tín hiệu rõ ràng từ AI")
 

@@ -1,6 +1,3 @@
-# === AI Binance Futures Bot (testnet) ===
-# Kết hợp thuật toán AI + giao dịch Futures với quản lý vốn 5%, chốt lời 3%, cắt lỗ 1.5%
-
 import time
 import os
 import pandas as pd
@@ -15,19 +12,35 @@ from binance.error import ClientError
 # ==== ENV ====
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
+
+# ==== Client Futures Testnet ====
 client = UMFutures(key=API_KEY, secret=API_SECRET, base_url="https://testnet.binancefuture.com")
 
 symbol = "BTCUSDT"
 interval = '1h'
 
-CAPITAL = 1000.0               # Tổng vốn (giả định hoặc quản lý nội bộ)
 ORDER_PERCENT = 0.05           # Mỗi lệnh tối đa 5%
-TP_PCT = 0.03                  # Take profit
-SL_PCT = 0.015                 # Stop loss
+TP_PCT = 0.03                 # Take profit 3%
+SL_PCT = 0.015                # Stop loss 1.5%
 
-open_positions = []            # Theo dõi vị thế mở: [{'qty':..., 'entry':...}]
+open_positions = []           # Theo dõi vị thế mở: [{'qty':..., 'entry':...}]
 
-# ==== Dữ liệu giá ====
+# ==== Lấy vốn thực tế trên Futures (USDT available) ====
+def get_total_capital():
+    try:
+        balance = client.balance()
+        usdt_bal = 0.0
+        for b in balance:
+            if b['asset'] == 'USDT':
+                usdt_bal = float(b['balance'])
+                break
+        print(f"\U0001F4B0 Vốn thực tế USDT hiện có: {usdt_bal}")
+        return usdt_bal
+    except Exception as e:
+        print(f"⚠️ Lỗi lấy vốn: {e}")
+        return 0.0
+
+# ==== Fetch dữ liệu giá ====
 def fetch_ohlcv(symbol, interval, lookback_days=365):
     end_time = datetime.utcnow()
     start_time = end_time - timedelta(days=lookback_days)
@@ -82,16 +95,15 @@ def train_model(df_feat):
 # ==== Đặt lệnh ====
 def place_order(side, qty):
     try:
-        return client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
+        order = client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
+        print(f"🟢 Đặt lệnh {side} thành công: {order['orderId']}")
+        return order
     except ClientError as e:
         print(f"❌ Lỗi đặt lệnh {side}: {e.error_message}")
         return None
 
-def get_price():
-    ticker = client.ticker_price(symbol=symbol)
-    return float(ticker['price'])
-
 def round_qty(value):
+    # Tùy theo symbol step size, ở đây làm tròn 3 chữ số thập phân
     return round(value, 3)
 
 # ==== Kiểm tra vị thế để đóng ====
@@ -116,6 +128,11 @@ def check_close_positions(price):
 # ==== Bot chính ====
 def run_bot():
     global open_positions
+    total_capital = get_total_capital()
+    if total_capital < 10:
+        print("⚠️ Vốn quá thấp, dừng chạy bot.")
+        return
+
     df = fetch_ohlcv(symbol, interval)
     df_feat = create_features(df)
     model = train_model(df_feat)
@@ -132,7 +149,7 @@ def run_bot():
 
     if pred == 1:
         print("✅ AI báo MUA")
-        usdt_amount = CAPITAL * ORDER_PERCENT
+        usdt_amount = total_capital * ORDER_PERCENT
         qty = round_qty(usdt_amount / price)
         if qty > 0:
             res = place_order('BUY', qty)
@@ -150,7 +167,7 @@ def run_bot():
 
 # ==== Loop ====
 if __name__ == '__main__':
-    print("🚀 Khởi động bot Futures...")
+    print("🚀 Khởi động bot Futures trên Testnet...")
     while True:
         try:
             run_bot()

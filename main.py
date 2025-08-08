@@ -79,7 +79,7 @@ def get_prediction(model, df):
 
 
 def get_top_symbols(limit=5):
-    tickers = client.ticker_24hr()
+    tickers = client.ticker_24hr_price_change()  # ✅ Sửa chỗ này
     df = pd.DataFrame(tickers)
     df['quoteVolume'] = pd.to_numeric(df['quoteVolume'], errors='coerce')
     df = df[df['symbol'].str.endswith('USDT') & ~df['symbol'].str.contains('1000')]

@@ -9,8 +9,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from datetime import datetime
 
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 
 if not API_KEY or not API_SECRET:
     raise ValueError("❌ Vui lòng đặt biến môi trường BINANCE_API_KEY và BINANCE_API_SECRET")

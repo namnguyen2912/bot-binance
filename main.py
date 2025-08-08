@@ -1,178 +1,114 @@
+# === [Binance Futures AI Trading Bot - Multi Coin, Improved Algo] ===
+
 import time
-import os
-import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from lightgbm import LGBMClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+import pandas as pd
 from binance.um_futures import UMFutures
-from binance.error import ClientError
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
 
-# ==== ENV ====
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
+api_key = "YOUR_API_KEY"
+api_secret = "YOUR_API_SECRET"
 
-# ==== Client Futures Testnet ====
-client = UMFutures(key=API_KEY, secret=API_SECRET, base_url="https://testnet.binancefuture.com")
+client = UMFutures(key=api_key, secret=api_secret)
 
-symbol = "BTCUSDT"
-interval = '1h'
+# === CONFIG ===
+CAPITAL = 1000.0  # virtual capital in USDT
+POSITION_SIZE = 0.05  # max 5% per trade
+TAKE_PROFIT = 0.03  # +3%
+STOP_LOSS = -0.015  # -1.5%
+TOP_N_SYMBOLS = 3  # number of coins to trade
+INTERVAL = "15m"
+CANDLE_LIMIT = 150
 
-ORDER_PERCENT = 0.05           # Mỗi lệnh tối đa 5%
-TP_PCT = 0.03                 # Take profit 3%
-SL_PCT = 0.015                # Stop loss 1.5%
+positions = {}  # virtual positions
 
-open_positions = []           # Theo dõi vị thế mở: [{'qty':..., 'entry':...}]
+# === Feature Engineering ===
+def calculate_features(df):
+    df['return'] = df['close'].pct_change()
+    df['volatility'] = df['return'].rolling(10).std()
+    df['rsi'] = compute_rsi(df['close'], 14)
+    df['ema_fast'] = df['close'].ewm(span=5).mean()
+    df['ema_slow'] = df['close'].ewm(span=20).mean()
+    df['macd'] = df['ema_fast'] - df['ema_slow']
+    df['bb_width'] = (df['close'].rolling(20).max() - df['close'].rolling(20).min()) / df['close']
+    df.dropna(inplace=True)
+    return df
 
-# ==== Lấy vốn thực tế trên Futures (USDT available) ====
-def get_total_capital():
-    try:
-        balance = client.balance()
-        usdt_bal = 0.0
-        for b in balance:
-            if b['asset'] == 'USDT':
-                usdt_bal = float(b['balance'])
-                break
-        print(f"\U0001F4B0 Vốn thực tế USDT hiện có: {usdt_bal}")
-        return usdt_bal
-    except Exception as e:
-        print(f"⚠️ Lỗi lấy vốn: {e}")
-        return 0.0
-
-# ==== Fetch dữ liệu giá ====
-def fetch_ohlcv(symbol, interval, lookback_days=365):
-    end_time = datetime.utcnow()
-    start_time = end_time - timedelta(days=lookback_days)
-    klines = client.klines(symbol=symbol, interval=interval, startTime=int(start_time.timestamp()*1000))
-    df = pd.DataFrame(klines, columns=["timestamp", "open", "high", "low", "close", "volume", "close_time",
-                                       "qav", "num_trades", "tbbav", "tbqav", "ignore"])
-    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-    df.columns = ['time', 'open', 'high', 'low', 'close', 'volume']
-    df['time'] = pd.to_datetime(df['time'], unit='ms')
-    df = df.astype(float, errors='ignore')
-    return df.dropna()
-
-# ==== Chỉ báo & đặc trưng ====
-def rsi(series, period=14):
+def compute_rsi(series, period):
     delta = series.diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(window=period).mean()
-    avg_loss = pd.Series(loss).rolling(window=period).mean()
-    rs = avg_gain / avg_loss
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def create_features(df):
-    df_feat = df.copy()
-    df_feat['return'] = df_feat['close'].pct_change()
-    df_feat['ema5'] = df_feat['close'].ewm(span=5).mean()
-    df_feat['ema10'] = df_feat['close'].ewm(span=10).mean()
-    df_feat['ema20'] = df_feat['close'].ewm(span=20).mean()
-    df_feat['ema_cross'] = np.where(df_feat['ema5'] > df_feat['ema10'], 1, -1)
-    df_feat['rsi'] = rsi(df_feat['close'])
-    df_feat['future_return'] = df_feat['close'].shift(-5) / df_feat['close'] - 1
-    df_feat['target'] = np.where(df_feat['future_return'] > 0.002, 1,
-                                 np.where(df_feat['future_return'] < -0.002, -1, 0))
-    return df_feat.dropna()
+# === Get top trading pairs by volume ===
+def get_top_symbols(limit=TOP_N_SYMBOLS):
+    tickers = client.ticker_24hr()
+    usdt_pairs = [t for t in tickers if t['symbol'].endswith('USDT') and not t['symbol'].endswith('BUSD')]
+    sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)
+    return [s['symbol'] for s in sorted_pairs[:limit]]
 
-# ==== Huấn luyện AI ====
-def train_model(df_feat):
-    X = df_feat[['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']]
-    y = df_feat['target']
+# === Train ML model ===
+def train_model(df):
+    df['future_return'] = df['close'].shift(-1) / df['close'] - 1
+    df['target'] = np.where(df['future_return'] > 0.007, 1, np.where(df['future_return'] < -0.007, -1, 0))
+    df.dropna(inplace=True)
+    features = ['return', 'volatility', 'rsi', 'macd', 'bb_width']
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df[features])
+    y = df['target']
+    clf = GradientBoostingClassifier()
+    clf.fit(X, y)
+    return clf, scaler, features
 
-    if len(X) < 100 or y.nunique() < 2:
-        print("⚠️ Dữ liệu không đủ.")
-        return None
+# === Execute Trade Logic ===
+def run_bot(symbol):
+    global CAPITAL
+    candles = client.klines(symbol=symbol, interval=INTERVAL, limit=CANDLE_LIMIT)
+    df = pd.DataFrame(candles, columns=["timestamp","open","high","low","close","volume","close_time","qav","trades","taker_base","taker_quote","ignore"])
+    df['close'] = df['close'].astype(float)
+    df = calculate_features(df)
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    model = LGBMClassifier(n_estimators=133, max_depth=7, learning_rate=0.05)
-    model.fit(X_train, y_train)
-    print("=== AI MODEL ===")
-    print(classification_report(y_test, model.predict(X_test)))
-    return model
+    model, scaler, feats = train_model(df.copy())
+    latest = df.iloc[-1:]
+    X_live = scaler.transform(latest[feats])
+    prediction = model.predict(X_live)[0]
+    proba = model.predict_proba(X_live)[0][prediction + 1]
 
-# ==== Đặt lệnh ====
-def place_order(side, qty):
-    try:
-        order = client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
-        print(f"🟢 Đặt lệnh {side} thành công: {order['orderId']}")
-        return order
-    except ClientError as e:
-        print(f"❌ Lỗi đặt lệnh {side}: {e.error_message}")
-        return None
+    print(f"🔍 {symbol} | Predict: {prediction} | Proba: {proba:.2f} | Capital: {CAPITAL:.2f}")
 
-def round_qty(value):
-    # Tùy theo symbol step size, ở đây làm tròn 3 chữ số thập phân
-    return round(value, 3)
-
-# ==== Kiểm tra vị thế để đóng ====
-def check_close_positions(price):
-    global open_positions
-    to_close = []
-    for i, pos in enumerate(open_positions):
-        entry = pos['entry']
-        qty = pos['qty']
-        pnl = (price - entry) / entry
-        if pnl >= TP_PCT:
-            print(f"🚀 Chốt lời {qty} BTC, vào {entry} ra {price} ({pnl*100:.2f}%)")
-            place_order('SELL', qty)
-            to_close.append(i)
-        elif pnl <= -SL_PCT:
-            print(f"🔻 Cắt lỗ {qty} BTC, vào {entry} ra {price} ({pnl*100:.2f}%)")
-            place_order('SELL', qty)
-            to_close.append(i)
-    for i in reversed(to_close):
-        open_positions.pop(i)
-
-# ==== Bot chính ====
-def run_bot():
-    global open_positions
-    total_capital = get_total_capital()
-    if total_capital < 10:
-        print("⚠️ Vốn quá thấp, dừng chạy bot.")
+    # Check if holding
+    if symbol in positions:
+        pos = positions[symbol]
+        current_price = float(client.ticker_price(symbol)['price'])
+        pnl = (current_price - pos['entry_price']) / pos['entry_price']
+        if pnl >= TAKE_PROFIT or pnl <= STOP_LOSS:
+            usdt_gained = pos['amount'] * current_price
+            CAPITAL += usdt_gained
+            print(f"✅ Exit {symbol} | PnL: {pnl:.2%} | Capital now: {CAPITAL:.2f}")
+            del positions[symbol]
         return
 
-    df = fetch_ohlcv(symbol, interval)
-    df_feat = create_features(df)
-    model = train_model(df_feat)
-    if model is None:
-        return
+    # Open new position if conditions met
+    if prediction == 1 and proba > 0.7 and symbol not in positions:
+        size_usdt = CAPITAL * POSITION_SIZE
+        price = float(client.ticker_price(symbol)['price'])
+        quantity = round(size_usdt / price, 6)
+        positions[symbol] = {
+            "entry_price": price,
+            "amount": quantity,
+        }
+        CAPITAL -= size_usdt
+        print(f"📈 BUY {symbol} | Qty: {quantity} | Price: {price:.2f} | Capital left: {CAPITAL:.2f}")
 
-    latest = df_feat.iloc[[-1]]
-    X_live = latest[['return', 'ema5', 'ema10', 'ema20', 'ema_cross', 'rsi']]
-    pred = model.predict(X_live)[0]
-    price = latest['close'].values[0]
-
-    print(f"\n📉 Giá hiện tại: {price:.2f} | Tín hiệu AI: {pred}")
-    check_close_positions(price)
-
-    if pred == 1:
-        print("✅ AI báo MUA")
-        usdt_amount = total_capital * ORDER_PERCENT
-        qty = round_qty(usdt_amount / price)
-        if qty > 0:
-            res = place_order('BUY', qty)
-            if res:
-                open_positions.append({'qty': qty, 'entry': price})
-    elif pred == -1:
-        print("✅ AI báo BÁN")
-        total_qty = round_qty(sum(p['qty'] for p in open_positions))
-        if total_qty > 0:
-            res = place_order('SELL', total_qty)
-            if res:
-                open_positions.clear()
-    else:
-        print("⏸️ AI không chắc chắn.")
-
-# ==== Loop ====
-if __name__ == '__main__':
-    print("🚀 Khởi động bot Futures trên Testnet...")
+# === Main Loop ===
+if __name__ == "__main__":
     while True:
-        try:
-            run_bot()
-            print("⏱️ Đợi 60s...")
-            time.sleep(60)
-        except Exception as e:
-            print(f"🔥 Lỗi: {e}")
-            time.sleep(60)
+        top_symbols = get_top_symbols()
+        for sym in top_symbols:
+            try:
+                run_bot(sym)
+            except Exception as e:
+                print(f"❌ Error with {sym}: {e}")
+        time.sleep(900)  # every 15 min
